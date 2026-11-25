@@ -1,0 +1,92 @@
+name: Publish static board preview
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_url:
+        description: Temporary download URL for the reviewed static site archive
+        required: true
+        type: string
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - name: Download approved static archive
+        env:
+          PREVIEW_ARCHIVE_URL: ${{ inputs.artifact_url }}
+        run: |
+          echo "::add-mask::$PREVIEW_ARCHIVE_URL"
+          curl --fail --silent --show-error --location --proto '=https' -- "$PREVIEW_ARCHIVE_URL" > preview.zip
+      - name: Prepare files for the Pages project address
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import re
+          
+          prefix = "/sms-olimpia-podglad"
+          site = Path("site")
+          with ZipFile("preview.zip") as archive:
+              for entry in archive.infolist():
+                  path = Path(entry.filename)
+                  if path.is_absolute() or ".." in path.parts:
+                      raise ValueError("Unsafe archive path")
+                  if path.suffix in {".html", ".js", ".css", ".png", ".jpg", ".webp", ".mp4", ".pdf", ".txt"} or path.name == ".nojekyll":
+                      archive.extract(entry, site)
+          
+          asset_paths = r"/(?:assets/|media/|sprawozdania/\d+\.pdf|sms-olimpia-logo\.png|favicon\.png)"
+          root_relative = re.compile(r"""(?<=[\x22\x27\x60])""" + asset_paths)
+          html_relative = re.compile(r"""((?:href|src|poster|action)=")/(?!/)""")
+          entry_count = 0
+          for path in site.rglob("*"):
+              if path.suffix not in {".html", ".js", ".css"}:
+                  continue
+              source = root_relative.sub(lambda match: prefix + match[0], path.read_text())
+              if path.suffix == ".html":
+                  source = html_relative.sub(
+                      lambda match: match[0][:-1] + prefix + "/",
+                      path.read_text(),
+                  )
+                  source = root_relative.sub(lambda match: prefix + match[0], source)
+                  source = source.replace(
+                      "</head>",
+                      """<meta name="robots" content="noindex"><script>
+          document.addEventListener("submit", function(event) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+            window.alert("Wysyłanie formularzy jest wyłączone w podglądzie.");
+          }, true);
+          </script></head>""",
+                      1,
+                  )
+              elif path.name.startswith("SiteLayout-"):
+                  source = source.replace("/#rodzic", prefix + "/#rodzic")
+              elif path.suffix == ".js" and path.name.startswith("index-"):
+                  old = 'basepath:' + chr(96) * 2 + ',serializationAdapters:'
+                  assert source.count(old) == 1, "Router base path marker changed"
+                  source = source.replace(old, 'basepath:"' + prefix + '",serializationAdapters:')
+                  old = 'return' + chr(96) + '/' + chr(96) + '+e'
+                  assert source.count(old) == 1, "Asset preload path marker changed"
+                  source = source.replace(old, 'return"' + prefix + '/"+e')
+                  entry_count += 1
+              path.write_text(source)
+          
+          assert entry_count == 1
+          for expected in ("index.html", "druzyny/index.html", "szkola/rekrutacja/index.html", "media/obiekty-olimpii.mp4", "sprawozdania/2025.pdf"):
+              assert (site / expected).is_file(), expected
+          PY
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - uses: actions/deploy-pages@v4
+        id: deploy
